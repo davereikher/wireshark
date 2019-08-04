@@ -19,7 +19,7 @@
  */
 
 #include "config.h"
-
+#include <signal.h>
 #include <epan/packet.h>
 #include <epan/addr_resolv.h>
 #include <epan/expert.h>
@@ -582,6 +582,9 @@ static expert_field ei_event_unknown_command = EI_INIT;
 static expert_field ei_parameter_unexpected = EI_INIT;
 static expert_field ei_manufacturer_data_changed = EI_INIT;
 static expert_field ei_bad_link_type = EI_INIT;
+static expert_field ei_no_corr_status_event = EI_INIT;
+static expert_field ei_no_corr_compl_event = EI_INIT;
+
 
 static dissector_table_t vendor_dissector_table;
 static dissector_table_t hci_vendor_table;
@@ -1101,6 +1104,12 @@ static const value_string packet_status_vals[] = {
 
 static const unit_name_string units_number_events = { " (number events)", NULL };
 
+/* When an HCI disconnect complete event is encountered, we need to revise previous commands in the capture and update 
+ * their pending_in_frame, pending_abs_ts, response_in_frame and response_abs_ts fields.
+ * It's best to limit how long back to go since for very large captures this could result in traversing a huge amount 
+ * of packets every time a disconnect complete event is encountered. Therefore a 1 minute window is set.
+ */
+static const nstime_t max_window_to_revise_commands_preceding_disconnect = {600, 0}; 
 
 void proto_register_bthci_evt(void);
 void proto_reg_handoff_bthci_evt(void);
@@ -1377,6 +1386,33 @@ dissect_bthci_evt_connect_request(tvbuff_t *tvb, int offset, packet_info *pinfo,
     return offset;
 }
 
+static gboolean
+call_foreach(const void *key _U_, void *value, void *data _U_){
+    bthci_cmd_data_t *bthci_cmd_data = (bthci_cmd_data_t*)value;
+//    packet_info *pinfo = (packet_info*)data;
+//    nstime_t delta;
+
+    if (bthci_cmd_data->pending_in_frame == max_disconnect_in_frame) 
+    {
+        bthci_cmd_data->pending_in_frame = 0;
+    }
+ 
+    if (bthci_cmd_data->response_in_frame == max_disconnect_in_frame) 
+    {
+        bthci_cmd_data->response_in_frame = 0;
+    }
+
+//    nstime_delta(&delta, &pinfo->abs_ts, &bthci_cmd_data->command_abs_ts);
+//    g_debug("DELTA IS (%ld, %d). \t\tcurr ts (%ld, %d),  \t\tcommand ts (%ld, %d), current i: %d, cmd i: %d", delta.secs, delta.nsecs, pinfo->abs_ts.secs, pinfo->abs_ts.nsecs, 
+//        bthci_cmd_data->command_abs_ts.secs, bthci_cmd_data->command_abs_ts.nsecs, pinfo->fd->num, bthci_cmd_data->command_in_frame);
+//    if (nstime_cmp(&max_window_to_revise_commands_preceding_disconnect, &delta) < 0)
+//    {
+//        return TRUE;
+//    }
+
+    return FALSE;
+}
+
 static int
 dissect_bthci_evt_disconnect_complete(tvbuff_t *tvb, int offset, packet_info *pinfo,
         proto_tree *tree, bluetooth_data_t *bluetooth_data)
@@ -1398,7 +1434,7 @@ dissect_bthci_evt_disconnect_complete(tvbuff_t *tvb, int offset, packet_info *pi
     offset += 1;
 
     if (!pinfo->fd->visited && status == STATUS_SUCCESS) {
-        wmem_tree_key_t     key[4];
+        wmem_tree_key_t     key[5];
         guint32             interface_id;
         guint32             adapter_id;
         chandle_session_t  *chandle_session;
@@ -1420,6 +1456,98 @@ dissect_bthci_evt_disconnect_complete(tvbuff_t *tvb, int offset, packet_info *pi
         chandle_session = (subtree) ? (chandle_session_t *) wmem_tree_lookup32_le(subtree, pinfo->num) : NULL;
         if (chandle_session && chandle_session->connect_in_frame < pinfo->num)
             chandle_session->disconnect_in_frame = pinfo->num;
+    
+//  guint32 __opcode = 0x41D;
+        key[0].length = 1;
+        key[0].key    = &interface_id;
+        key[1].length = 1;
+        key[1].key    = &adapter_id;
+        key[2].length = 0;
+        key[2].key    = NULL;
+    //key is an identifier of the corresponding command. It is comprised of the interface id, adapater id and the opcode of the command
+
+        subtree = (wmem_tree_t *) wmem_tree_lookup32_array(bthci_cmds, key); // Get all commands from bthci_cmds which correspond to this interface_id, adapter_id and opcode
+    g_debug("SUBTREE is %08lx", (unsigned long)subtree);
+
+//        bthci_cmd_data_t* bthci_cmd_data = (subtree) ? (bthci_cmd_data_t *) wmem_tree_lookup32_le(subtree, 0x41D) : NULL;
+//  g_debug("BTHCI_CMD_DATA IS %08lx", (unsigned long)bthci_cmd_data);
+//  if (bthci_cmd_data) {
+//      g_debug("OPCODE IS %d", bthci_cmd_data->opcode);
+//  }
+
+        wmem_tree_foreach(bthci_cmds, call_foreach, (void*)pinfo);
+/*
+        i_frame_number = frame_number; //start with the frame number of the current packet
+        do {
+        char* STATUS_NORMAL = "NORMAL";
+        char* STATUS_RESULT = "RESULT";
+        char* STATUS_PENDING = "PENDING";
+        char* __status = NULL;
+        switch (opcode_list_data->command_status)
+        {
+            case COMMAND_STATUS_NORMAL:
+                __status = STATUS_NORMAL;
+            break;
+            case COMMAND_STATUS_PENDING:
+                __status = STATUS_PENDING;
+            break;
+            case COMMAND_STATUS_RESULT:
+                __status = STATUS_RESULT;
+            break;
+        }
+        g_debug("Counter frame number: %d, current frame number: %d, command status: %s", i_frame_number, frame_number, __status);
+        //starting from this frame number, go backwards and look for the command
+            bthci_cmd_data = (subtree) ? (bthci_cmd_data_t *) wmem_tree_lookup32_le(subtree, i_frame_number) : NULL;
+    
+        if (bthci_cmd_data)
+            g_debug("\tcommand_in_frame: %d, pending_in_frame: %d, response_in_frame: %d", bthci_cmd_data->command_in_frame, bthci_cmd_data->pending_in_frame, bthci_cmd_data->response_in_frame);
+        // COMMAND_STATUS_NORMAL is the status of the command after a command complete event was received for this command
+        // COMMAND_STATUS_PENDING is the status of the command if a command status event returned with Status = Success (0x00)
+        // COMMAND_STATUS_RESULT is the stats of the command is a command status event returned with Status != Success
+        //
+        //The problem is here. The command that precedes the disconnect event is either missing pending_in_frame or response_in_frame, since there are no 
+        // corresponding events after the disconnect event. Thus, when traversing the relevant commands in bthci_cmds backwards, as it's done here, the search is 
+        // for the earliest command that has either pending_in_frame or response_in_frame unset. Therefore the command that will be matched is not the command that should be matched,
+        // the one that follows the disconnect event, but the one preceding it.
+
+            if (bthci_cmd_data && bthci_cmd_data->command_in_frame < frame_number && ( // (command is in some previous frame) AND
+                        (opcode_list_data->command_status == COMMAND_STATUS_NORMAL &&  // if the command status = COMMAND_STATUS_NORMAL:
+                    (bthci_cmd_data->response_in_frame == frame_number ||              //     (this is the command complete event) OR 
+                    bthci_cmd_data->response_in_frame == max_disconnect_in_frame)) ||  //     (the command comlete event hasn't yet been reached)
+                        (opcode_list_data->command_status == COMMAND_STATUS_PENDING && // if the command status = COMMAND_STATUS_PENDING:
+                    (bthci_cmd_data->pending_in_frame == frame_number ||               //     (this is the pending event) OR
+                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame ||  //     ((the command complete is in the future or unknown) AND (the pending event is unknown))
+                    bthci_cmd_data->response_in_frame > frame_number) &&
+                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))) ||  
+                        (opcode_list_data->command_status == COMMAND_STATUS_RESULT &&  // if the command status = COMMAND_STATUS_RESULT:
+                    (bthci_cmd_data->response_in_frame == frame_number ||              //     (this is the command complete event) OR 
+                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame &&  //     ((the response hasn't yet been reached) AND 
+                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))))    //     (the pending event hasn't yet been reached))
+                    )) {
+                lastest_bthci_cmd_data = bthci_cmd_data;
+            //g_debug("Got latest bthci_cmd_data. Name: %s", lastest_bthci_cmd_data->data.name);
+                if (((opcode_list_data->command_status == COMMAND_STATUS_RESULT ||
+                        opcode_list_data->command_status == COMMAND_STATUS_NORMAL) &&
+                        bthci_cmd_data->response_in_frame == frame_number) ||
+                        (opcode_list_data->command_status == COMMAND_STATUS_PENDING &&
+                        bthci_cmd_data->pending_in_frame == frame_number)) {
+                    opcode_list_frame = NULL;
+                    break;
+                }
+            }
+
+            g_debug("latest_bthci_cmd_data: %08lx", (unsigned long)lastest_bthci_cmd_data);
+
+            if (bthci_cmd_data && bthci_cmd_data->command_in_frame < frame_number) {
+                i_frame_number = bthci_cmd_data->command_in_frame - 1;
+                if (i_frame_number < 1)
+                    bthci_cmd_data = NULL;
+            } else {
+                bthci_cmd_data = NULL;
+            }
+        } while (bthci_cmd_data);
+*/
+
     }
 
     return offset;
@@ -2108,6 +2236,10 @@ dissect_bthci_evt_command_status(tvbuff_t *tvb, int offset, packet_info *pinfo,
     offset += 1;
 
     opcode = tvb_get_letohs(tvb, offset);
+    if (0x41D == opcode)
+    {   
+        g_debug("STATUS EVENT for get remote version information");
+    }
     ogf = opcode >> 10;
 
     if (have_tap_listener(bluetooth_hci_summary_tap)) {
@@ -5690,6 +5822,7 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
 
         case 0x05: /* Disconnection Complete */
             offset = dissect_bthci_evt_disconnect_complete(tvb, offset, pinfo, bthci_evt_tree, bluetooth_data);
+        g_debug("DISCONNECT complete");
             add_opcode(opcode_list, 0x0406, COMMAND_STATUS_NORMAL); /* Disconnection Connection */
             break;
 
@@ -5725,6 +5858,7 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
         case 0x0c: /* Read Remote Version Information Complete */
             offset = dissect_bthci_evt_read_remote_version_information_complete(tvb, offset, pinfo, bluetooth_data, bthci_evt_tree);
             add_opcode(opcode_list, 0x41D, COMMAND_STATUS_NORMAL); /* Read Remote Version Information */
+        g_debug("EVENT COMPLETE for get remote version information");
             break;
 
         case 0x0d: /* QoS Setup Complete */
@@ -6129,7 +6263,8 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
 
     opcode_list_frame = wmem_list_head(opcode_list);
 
-    while (opcode_list_frame) {
+    while (opcode_list_frame) { 
+    //Each event code results in a a list of possible command opcodes that could have caused it. This loops over this opcode list
         wmem_tree_key_t      key[4];
         guint32              interface_id;
         guint32              adapter_id;
@@ -6140,10 +6275,10 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
 
         interface_id = bluetooth_data->interface_id;
         adapter_id   = bluetooth_data->adapter_id;
-        frame_number = pinfo->num;
+        frame_number = pinfo->num; //frame number of current packet
 
         opcode_list_data = (opcode_list_data_t *) wmem_list_frame_data(opcode_list_frame);
-        opcode = opcode_list_data->opcode;
+        opcode = opcode_list_data->opcode; //the opcode in this iteration of the enclosing loop
 
         key[0].length = 1;
         key[0].key    = &interface_id;
@@ -6154,27 +6289,59 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
         key[3].length = 0;
         key[3].key    = NULL;
 
-        subtree = (wmem_tree_t *) wmem_tree_lookup32_array(bthci_cmds, key);
+    //key is an identifier of the corresponding command. It is comprised of the interface id, adapater id and the opcode of the command
 
-        i_frame_number = frame_number;
+        subtree = (wmem_tree_t *) wmem_tree_lookup32_array(bthci_cmds, key); // Get all commands from bthci_cmds which correspond to this interface_id, adapter_id and opcode
 
+        i_frame_number = frame_number; //start with the frame number of the current packet
         do {
+        char* STATUS_NORMAL = "NORMAL";
+        char* STATUS_RESULT = "RESULT";
+        char* STATUS_PENDING = "PENDING";
+        char* __status = NULL;
+        switch (opcode_list_data->command_status)
+        {
+            case COMMAND_STATUS_NORMAL:
+                __status = STATUS_NORMAL;
+            break;
+            case COMMAND_STATUS_PENDING:
+                __status = STATUS_PENDING;
+            break;
+            case COMMAND_STATUS_RESULT:
+                __status = STATUS_RESULT;
+            break;
+        }
+        g_debug("Counter frame number: %d, current frame number: %d, command status: %s", i_frame_number, frame_number, __status);
+        //starting from this frame number, go backwards and look for the command
             bthci_cmd_data = (subtree) ? (bthci_cmd_data_t *) wmem_tree_lookup32_le(subtree, i_frame_number) : NULL;
-            if (bthci_cmd_data && bthci_cmd_data->command_in_frame < frame_number && (
-                        (opcode_list_data->command_status == COMMAND_STATUS_NORMAL &&
-                    (bthci_cmd_data->response_in_frame == frame_number ||
-                    bthci_cmd_data->response_in_frame == max_disconnect_in_frame)) ||
-                        (opcode_list_data->command_status == COMMAND_STATUS_PENDING &&
-                    (bthci_cmd_data->pending_in_frame == frame_number ||
-                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame ||
+    
+        if (bthci_cmd_data)
+            g_debug("\tcommand_in_frame: %d, pending_in_frame: %d, response_in_frame: %d", bthci_cmd_data->command_in_frame, bthci_cmd_data->pending_in_frame, bthci_cmd_data->response_in_frame);
+        // COMMAND_STATUS_NORMAL is the status of the command after a command complete event was received for this command
+        // COMMAND_STATUS_PENDING is the status of the command if a command status event returned with Status = Success (0x00)
+        // COMMAND_STATUS_RESULT is the stats of the command is a command status event returned with Status != Success
+        //
+        //The problem is here. The command that precedes the disconnect event is either missing pending_in_frame or response_in_frame, since there are no 
+        // corresponding events after the disconnect event. Thus, when traversing the relevant commands in bthci_cmds backwards, as it's done here, the search is 
+        // for the earliest command that has either pending_in_frame or response_in_frame unset. Therefore the command that will be matched is not the command that should be matched,
+        // the one that follows the disconnect event, but the one preceding it.
+
+            if (bthci_cmd_data && bthci_cmd_data->command_in_frame < frame_number && ( // (command is in some previous frame) AND
+                        (opcode_list_data->command_status == COMMAND_STATUS_NORMAL &&  // if the command status = COMMAND_STATUS_NORMAL:
+                    (bthci_cmd_data->response_in_frame == frame_number ||              //     (this is the command complete event) OR 
+                    bthci_cmd_data->response_in_frame == max_disconnect_in_frame)) ||  //     (the command comlete event hasn't yet been reached)
+                        (opcode_list_data->command_status == COMMAND_STATUS_PENDING && // if the command status = COMMAND_STATUS_PENDING:
+                    (bthci_cmd_data->pending_in_frame == frame_number ||               //     (this is the pending event) OR
+                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame ||  //     ((the command complete is in the future or unknown) AND (the pending event is unknown))
                     bthci_cmd_data->response_in_frame > frame_number) &&
-                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))) ||
-                        (opcode_list_data->command_status == COMMAND_STATUS_RESULT &&
-                    (bthci_cmd_data->response_in_frame == frame_number ||
-                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame &&
-                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))))
+                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))) ||  
+                        (opcode_list_data->command_status == COMMAND_STATUS_RESULT &&  // if the command status = COMMAND_STATUS_RESULT:
+                    (bthci_cmd_data->response_in_frame == frame_number ||              //     (this is the command complete event) OR 
+                    ((bthci_cmd_data->response_in_frame == max_disconnect_in_frame &&  //     ((the response hasn't yet been reached) AND 
+                    bthci_cmd_data->pending_in_frame == max_disconnect_in_frame))))    //     (the pending event hasn't yet been reached))
                     )) {
                 lastest_bthci_cmd_data = bthci_cmd_data;
+            //g_debug("Got latest bthci_cmd_data. Name: %s", lastest_bthci_cmd_data->data.name);
                 if (((opcode_list_data->command_status == COMMAND_STATUS_RESULT ||
                         opcode_list_data->command_status == COMMAND_STATUS_NORMAL) &&
                         bthci_cmd_data->response_in_frame == frame_number) ||
@@ -6184,6 +6351,8 @@ dissect_bthci_evt(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
                     break;
                 }
             }
+
+            g_debug("latest_bthci_cmd_data: %08lx", (unsigned long)lastest_bthci_cmd_data);
 
             if (bthci_cmd_data && bthci_cmd_data->command_in_frame < frame_number) {
                 i_frame_number = bthci_cmd_data->command_in_frame - 1;
@@ -8941,6 +9110,8 @@ proto_register_bthci_evt(void)
         { &ei_parameter_unexpected,       { "bthci_evt.expert.parameter.unexpected",            PI_PROTOCOL, PI_WARN,      "Unexpected command parameter", EXPFILL }},
         { &ei_manufacturer_data_changed,  { "bthci_evt.expert.event.manufacturer_data_changed", PI_PROTOCOL, PI_WARN,      "Manufacturer data changed", EXPFILL }},
         { &ei_bad_link_type,              { "bthci_evt.expert.bad_link_type",                   PI_PROTOCOL, PI_WARN,      "Bad Link type, should be ACL or SCO", EXPFILL }},
+        { &ei_no_corr_status_event,       { "bthci_evt.expert.event.nostatus",                  PI_SEQUENCE, PI_NOTE,      "No corresponding status event due to disconnection", EXPFILL }},
+        { &ei_no_corr_compl_event,        { "bthci_evt.expert.event.no_completion",             PI_SEQUENCE, PI_NOTE,      "No corresponding completion event due to disconnection", EXPFILL }},
     };
 
     /* Setup protocol subtree array */

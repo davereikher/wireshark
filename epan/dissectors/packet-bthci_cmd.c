@@ -5088,6 +5088,12 @@ dissect_bthci_cmd(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
     }
 
     opcode = tvb_get_letohs(tvb, offset);
+    
+    if (0x41D == opcode)
+    {	
+	    g_debug("COMMAND get remote version information");
+    }
+
     ocf = opcode & 0x03ff;
     ogf = (guint8) (opcode >> 10);
 
@@ -5254,6 +5260,7 @@ dissect_bthci_cmd(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *dat
 
     subtree = (wmem_tree_t *) wmem_tree_lookup32_array(bthci_cmds, key);
     bthci_cmd_data = (subtree) ? (bthci_cmd_data_t *) wmem_tree_lookup32_le(subtree, pinfo->num) : NULL;
+    g_debug("bthci_cmd_data: %08lx", (unsigned long)bthci_cmd_data);
     if (bthci_cmd_data && bthci_cmd_data->pending_in_frame < max_disconnect_in_frame) {
         nstime_t  delta;
 
